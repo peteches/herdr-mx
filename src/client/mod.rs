@@ -10384,6 +10384,56 @@ mod tests {
         }
     }
 
+    // #91: a keyboard agent-focus step must target the row's PUBLIC pane id (the `agent_id` the
+    // client stores from the wire `AgentInfo.pane_id`), never the terminal id — the server's agent
+    // target resolution rejects a terminal id. Mirrors `step_workspace_focus_anchors_on_active_server`
+    // by driving `step_agent_focus` directly and asserting the wire request it produces.
+    #[test]
+    fn step_agent_focus_request_targets_public_pane_id() {
+        let mut model = supervisor::ClientSupervisorModel::new("local");
+        model
+            .set_summary(
+                &supervisor::ServerId::main(),
+                supervisor::ServerSummary {
+                    workspaces: vec![supervisor::WorkspaceSummary {
+                        workspace_id: "w1".into(),
+                        label: "herdr".into(),
+                        branch: None,
+                        focused: true,
+                        ..Default::default()
+                    }],
+                    agents: vec![supervisor::AgentSummary {
+                        agent_id: "w1:p1".into(),
+                        workspace_id: "w1".into(),
+                        label: "claude".into(),
+                        status: "idle".into(),
+                        focused: false,
+                        pane_label: None,
+                        tab_id: String::new(),
+                        tab_label: None,
+                    }],
+                },
+            )
+            .unwrap();
+
+        let dispatch = step_agent_focus(&mut model, 1);
+        assert_eq!(
+            dispatch,
+            ClientInputDispatch::ApiRequest {
+                server_id: supervisor::ServerId::main(),
+                refresh: ClientApiRefreshPolicy::Deferred,
+                request: Box::new(crate::api::schema::Request {
+                    id: "client:agent-focus".into(),
+                    method: crate::api::schema::Method::AgentFocus(
+                        crate::api::schema::AgentTarget {
+                            target: "w1:p1".into(),
+                        },
+                    ),
+                }),
+            }
+        );
+    }
+
     // A new-workspace key opens the picker (multi-destination → Redraw, picker overlay set).
     #[test]
     fn new_workspace_key_opens_picker() {

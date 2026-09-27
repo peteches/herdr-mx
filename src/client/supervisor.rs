@@ -141,6 +141,10 @@ pub(crate) struct WorkspaceSummary {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct AgentSummary {
+    /// Row identity AND the `agent.focus` target: the wire `AgentInfo.pane_id` (public pane id,
+    /// `{workspace_id}:p{n}`). NOT the terminal id — the server's agent target resolution
+    /// (`resolve_agent_target`) accepts only public pane ids and unique agent names, so a
+    /// terminal id is not a valid focus target (issue #91).
     pub(crate) agent_id: String,
     pub(crate) workspace_id: String,
     pub(crate) label: String,
@@ -4218,7 +4222,7 @@ impl ServerSummary {
                     let label = agent_label(&agent);
                     let status = agent_status_label(agent.agent_status);
                     AgentSummary {
-                        agent_id: agent.terminal_id,
+                        agent_id: agent.pane_id,
                         workspace_id: agent.workspace_id,
                         label,
                         status,
@@ -4481,6 +4485,7 @@ mod tests {
         label: &str,
         status: crate::api::schema::AgentStatus,
         focused: bool,
+        pane_id: &str,
     ) -> crate::api::schema::AgentInfo {
         crate::api::schema::AgentInfo {
             terminal_id: terminal_id.into(),
@@ -4499,7 +4504,7 @@ mod tests {
             agent_session: None,
             workspace_id: workspace_id.into(),
             tab_id: "tab-1".into(),
-            pane_id: "pane-1".into(),
+            pane_id: pane_id.into(),
             focused,
             launch_pending: false,
             interactive_ready: false,
@@ -4730,6 +4735,7 @@ mod tests {
                 "claude",
                 crate::api::schema::AgentStatus::Working,
                 true,
+                "pane-1",
             )],
             ..FakeSupervisorApi::default()
         };
@@ -4791,7 +4797,7 @@ mod tests {
                 label: "herdr".into(),
                 focused: true,
                 agents: vec![AgentSidebarRow {
-                    agent_id: "terminal-1".into(),
+                    agent_id: "pane-1".into(),
                     label: "claude".into(),
                     status: "working".into(),
                     focused: true,
@@ -4904,6 +4910,7 @@ mod tests {
                 "claude",
                 crate::api::schema::AgentStatus::Idle,
                 true,
+                "pane-1",
             )],
             ..FakeSupervisorApi::default()
         };
@@ -4937,6 +4944,51 @@ mod tests {
                     worktree_is_linked: false,
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn from_api_agent_id_is_public_pane_id_not_terminal_id() {
+        let summary = ServerSummary::from_api(
+            vec![workspace_info("w1", "herdr", true)],
+            vec![agent_info(
+                "term_abc",
+                "w1",
+                "claude",
+                crate::api::schema::AgentStatus::Idle,
+                false,
+                "w1:p1",
+            )],
+        );
+        assert_eq!(summary.agents[0].agent_id, "w1:p1");
+    }
+
+    #[test]
+    fn agent_focus_request_targets_public_pane_id_from_api_summary() {
+        let mut model = ClientSupervisorModel::new("local");
+        let mut api = FakeSupervisorApi {
+            workspaces: vec![workspace_info("w1", "herdr", true)],
+            agents: vec![agent_info(
+                "term_abc",
+                "w1",
+                "claude",
+                crate::api::schema::AgentStatus::Idle,
+                false,
+                "w1:p1",
+            )],
+            ..FakeSupervisorApi::default()
+        };
+        model.refresh_main_summary_from_api(&mut api).unwrap();
+
+        let request = model
+            .focus_agent_route(&ServerId::main(), "w1:p1")
+            .api_request("client:agent-focus")
+            .unwrap();
+        assert_eq!(
+            request.method,
+            crate::api::schema::Method::AgentFocus(crate::api::schema::AgentTarget {
+                target: "w1:p1".into(),
+            })
         );
     }
 
