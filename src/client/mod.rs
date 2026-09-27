@@ -154,6 +154,8 @@ struct ClientState {
     pending_pings: HashMap<supervisor::ServerId, (u64, Instant)>,
     /// issue #13: last time stream latency probes were sent.
     last_ping_at: Instant,
+    /// Last time the event-loop liveness heartbeat was logged (see `LOOP_HEARTBEAT_INTERVAL`).
+    last_loop_heartbeat_at: Instant,
     /// Servers with active summary-event subscription workers.
     summary_subscription_server_ids: HashSet<supervisor::ServerId>,
     /// Secondary servers with a summary refresh already running off the UI loop.
@@ -4207,8 +4209,8 @@ fn start_single_secondary_summary_refresh(
     pending: &mut HashSet<supervisor::ServerId>,
     event_tx: &tokio::sync::mpsc::Sender<ClientLoopEvent>,
 ) {
-    // Main-server id: no SSH fetch. The caller performs the local `&mut`
-    // `refresh_main_summary_from_api` (D1 signature constraint).
+    // Main-server id: no SSH fetch. The caller spawns the off-loop
+    // `spawn_main_supervisor_refresh` instead (D1 signature constraint).
     if *server_id == supervisor::ServerId::main() {
         return;
     }
@@ -5142,6 +5144,11 @@ const RX_RATE_SAMPLE_INTERVAL: Duration = Duration::from_millis(1000);
 /// round-trip time without the per-request bridge-connection / remote-process-spawn cost.
 const SERVER_PING_INTERVAL: Duration = Duration::from_millis(1000);
 
+/// Cadence for the event-loop liveness heartbeat (see `state.last_loop_heartbeat_at`). Logged at
+/// `info` (the default `HERDR_LOG` level) specifically so a wedged loop is visible as a *gap* in
+/// an otherwise unremarkable log, rather than needing debug verbosity turned on ahead of time.
+const LOOP_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(60);
+
 /// Derive each server's recent downstream bytes/sec from the cumulative reader counters and push
 /// it into the supervisor model for the host banner. Rate-limited to [`RX_RATE_SAMPLE_INTERVAL`].
 fn sample_download_rates(state: &mut ClientState, now: Instant) {
@@ -5274,6 +5281,7 @@ async fn run_client_loop(
         ping_nonce: 0,
         pending_pings: HashMap::new(),
         last_ping_at: Instant::now(),
+        last_loop_heartbeat_at: Instant::now(),
         summary_subscription_server_ids: HashSet::new(),
         pending_summary_refresh_server_ids: HashSet::new(),
         pending_main_refresh: false,
@@ -6118,16 +6126,23 @@ async fn run_client_loop(
                     "supervisor summary event requested refresh"
                 );
                 // item 6 (Area 6): targeted event-push — refresh ONLY the changed server, not the
-                // whole fleet. A main id refreshes locally (`&mut`); a secondary id spawns a single
-                // off-loop fetch (the helper is a no-op on a main id).
+                // whole fleet. A main id spawns the off-loop main-supervisor refresh; a secondary
+                // id spawns a single off-loop fetch (the helper is a no-op on a main id).
                 let now = Instant::now();
                 if let Some(model) = &mut state.supervisor_model {
                     if server_id == supervisor::ServerId::main() {
-                        if let Err(err) = model.refresh_main_summary_from_api(
-                            &mut crate::api::client::ApiClient::local(),
-                        ) {
-                            warn!(err = %err, "failed to refresh changed main summary");
-                        }
+                        // #42 follow-up: this used to call refresh_main_summary_from_api()
+                        // INLINE on the UI/event-loop thread — up to two blocking local-socket
+                        // round trips (SUPERVISOR_API_TIMEOUT each) per event, with no
+                        // coalescing. The periodic path was moved off-loop for exactly this
+                        // reason (see spawn_main_supervisor_refresh's doc comment); this path
+                        // was missed. A burst of summary-changed pushes could stall the sole
+                        // consumer of the bounded event_tx channel for extended stretches, which
+                        // in turn stalls every other producer on it (secondary reconnect
+                        // workers, remotes' summary-subscription threads, ...) — reusing
+                        // spawn_main_supervisor_refresh moves this off-loop and gets its
+                        // pending_main_refresh coalescing for free.
+                        spawn_main_supervisor_refresh(&mut state.pending_main_refresh, &event_tx);
                     } else {
                         start_single_secondary_summary_refresh(
                             model,
@@ -6245,15 +6260,17 @@ async fn run_client_loop(
                         } else if refresh == ClientApiRefreshPolicy::ImmediateFocused {
                             // item 6 (Area 6): targeted single-server fetch for the focused server
                             // ONLY (not the whole fleet). A focused main workspace produces
-                            // server_id == main, so the local `&mut` refresh path is reachable.
+                            // server_id == main, so the off-loop main-refresh path is reachable.
                             let now = Instant::now();
                             if let Some(model) = &mut state.supervisor_model {
                                 if server_id == supervisor::ServerId::main() {
-                                    if let Err(err) = model.refresh_main_summary_from_api(
-                                        &mut crate::api::client::ApiClient::local(),
-                                    ) {
-                                        warn!(err = %err, "failed to refresh focused main summary");
-                                    }
+                                    // Same off-load as the SupervisorSummaryChanged handler above:
+                                    // avoid blocking the UI/event-loop thread with an inline
+                                    // local-socket round trip.
+                                    spawn_main_supervisor_refresh(
+                                        &mut state.pending_main_refresh,
+                                        &event_tx,
+                                    );
                                 } else {
                                     start_single_secondary_summary_refresh(
                                         model,
@@ -6753,6 +6770,27 @@ async fn run_client_loop(
                             state.pending_pings.insert(server_id.clone(), (nonce, now));
                         }
                     }
+                }
+                // Liveness heartbeat: a live-debugged incident showed the client's sidebar stuck
+                // on a stale "offline" badge for ~90 minutes with a completely silent
+                // herdr-client.log, indistinguishable from a loop that was simply idle. Since the
+                // Timer event only reaches this handler when the event loop IS still draining
+                // `event_tx`, a gap in this line (rather than its absence) is the tell for a
+                // wedged loop — most plausibly the bounded channel backing up behind a stalled
+                // consumer. Logged at `info` (the default level) on purpose: this must show up
+                // without turning on debug verbosity ahead of an incident.
+                if now.duration_since(state.last_loop_heartbeat_at) >= LOOP_HEARTBEAT_INTERVAL {
+                    state.last_loop_heartbeat_at = now;
+                    info!(
+                        event_queue_len = event_tx.max_capacity() - event_tx.capacity(),
+                        event_queue_capacity = event_tx.max_capacity(),
+                        pending_main_refresh = state.pending_main_refresh,
+                        pending_secondary_summary_refreshes =
+                            state.pending_summary_refresh_server_ids.len(),
+                        pending_secondary_connects = state.pending_secondary_connect_server_ids.len(),
+                        connected_servers = server_writes.len(),
+                        "client event loop heartbeat"
+                    );
                 }
                 retry_due_secondary_connections(&mut state, now, &event_tx, &mut server_writes);
 
@@ -7825,6 +7863,7 @@ mod tests {
             ping_nonce: 0,
             pending_pings: HashMap::new(),
             last_ping_at: Instant::now(),
+            last_loop_heartbeat_at: Instant::now(),
             summary_subscription_server_ids: HashSet::new(),
             pending_summary_refresh_server_ids: HashSet::new(),
             pending_main_refresh: false,

@@ -1418,15 +1418,6 @@ impl ClientSupervisorModel {
         }
     }
 
-    pub(crate) fn refresh_main_summary_from_api(
-        &mut self,
-        api: &mut impl SupervisorApi,
-    ) -> Result<(), String> {
-        let summary = request_server_summary(api)?;
-        self.set_summary(&ServerId::main(), summary)
-            .map_err(|()| "main server is missing from supervisor model".to_string())
-    }
-
     /// #42: apply a [`MainSupervisorSnapshot`] fetched off the UI loop (registry + UI settings +
     /// main summary). This is the on-loop-thread half of the async main refresh; it does the same
     /// three applies the old inline `refresh_main_local_summaries` did, just without the blocking
@@ -4884,7 +4875,7 @@ mod tests {
     }
 
     #[test]
-    fn refresh_main_summary_from_api_replaces_main_summary_only() {
+    fn main_summary_refresh_replaces_main_summary_only() {
         let mut model = ClientSupervisorModel::new("local");
         let remote_id = model.add_secondary(ssh_remote("remote-x", "x", "x"));
         model
@@ -4915,7 +4906,8 @@ mod tests {
             ..FakeSupervisorApi::default()
         };
 
-        model.refresh_main_summary_from_api(&mut api).unwrap();
+        let summary = request_server_summary(&mut api).unwrap();
+        model.set_summary(&ServerId::main(), summary).unwrap();
 
         assert_eq!(api.requests, vec!["workspace.list", "agent.list"]);
         assert_eq!(
